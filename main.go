@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"net"
 	"github.com/jinzhu/gorm"
 	_ "github.com/mattn/go-sqlite3"
 	"io/ioutil"
@@ -13,13 +15,26 @@ import (
 	"time"
 )
 
+var DefaultTransport http.RoundTripper
+
 func init() {
 	rand.Seed(time.Now().UnixNano())
+	ClientHostname, _ = os.Hostname()
+	ClientIp =  GetLocalIP()
+	DefaultTransport = &http.Transport{
+        Dial: (&net.Dialer{
+                Timeout:   107 * time.Second,
+                KeepAlive: 200 * time.Second,
+        }).Dial,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
 }
+
 
 var wg sync.WaitGroup
 var db *gorm.DB
-
+var ClientHostname string
+var ClientIp string
 func main() {
 	var err error
 	db, err = dbInit()
@@ -35,6 +50,8 @@ func main() {
 		"http://www.nrc.ca/robots.txt",
 		"http://192.168.0.1/",
 		"http://192.168.0.11/",
+		"https://gcdocs.gc.ca/nrcan-rncan/llisapi.dll",
+
 	}
 	for _, url := range urls {
 		go getUrl(url, postBodyBytes)
@@ -47,7 +64,10 @@ const Million = 1000000
 
 func getUrl(urlString string, postBody []byte) {
 	defer wg.Done()
-	url := &Url{Url: urlString}
+	url := &UrlRequest{Url: urlString,
+		ClientHostname: ClientHostname,
+		ClientIp: ClientIp,
+	}
 	results := &Results{
 		Url:              *url,
 		Success:          false,
@@ -63,15 +83,31 @@ func getUrl(urlString string, postBody []byte) {
 
 		t0 := time.Now()
 		results.RequestTimeStamp = t0
-
-		res, err := http.Get(url.Url)
-		if err != nil {
+		timeout := time.Duration(150 * time.Second)
+		client := http.Client{
+			Timeout: timeout,
+			Transport:DefaultTransport,
+		}
+		req, err := http.NewRequest("GET", url.Url, nil)
+		if err != nil{
 			results.Error = err.Error()
 			log.Println(err)
 			return
 		}
-		_, err = ioutil.ReadAll(res.Body)
+		req.Header.Add("User-Agent", "floem")
+		res, err := client.Do(req)
 		t1 := time.Now()
+		results.RequestTimeMillis = t1.Sub(t0).Nanoseconds() / Million
+		if err != nil {
+			results.Error = err.Error()
+			log.Println("-------------")
+			log.Println("zzzz ERROR::::: ")
+			log.Println(err)
+			log.Println("-------------")
+			return
+		}
+		_, err = ioutil.ReadAll(res.Body)
+
 		res.Body.Close()
 		if err != nil {
 			results.Error = err.Error()
@@ -85,10 +121,15 @@ func getUrl(urlString string, postBody []byte) {
 		fmt.Printf("Time to respond: %v\n\n", t1.Sub(t0))
 
 		t0 = time.Now()
-		res, err = http.Post(url.Url, "application/octet-stream", bytes.NewBuffer(postBody))
+		req, err = http.NewRequest("POST", url.Url, bytes.NewBuffer(postBody))
+		req.Header.Add("User-Agent", "floem")
+		req.Header.Add("Content-Type", "application/octet-stream")
+		res, err = client.Do(req)
 		//client := &http.Client{}
 
 		//res, err = client.Do(req)
+		t1 = time.Now()
+		results.RequestTimeMillis = t1.Sub(t0).Nanoseconds() / Million
 		if err != nil {
 			results.Error = err.Error()
 			log.Println("-------------")
@@ -100,8 +141,7 @@ func getUrl(urlString string, postBody []byte) {
 		}
 		defer res.Body.Close()
 
-		t1 = time.Now()
-		results.RequestTimeMillis = t1.Sub(t0).Nanoseconds() / Million
+
 		results.HttpStatus = res.StatusCode
 		results.Success = true
 		results.SetHttpMethodPost()
@@ -146,4 +186,21 @@ func makeBodyPostMBytes(n int) []byte {
 	}
 	postBodyCache[n] = b
 	return b
+}
+
+//From: http://stackoverflow.com/questions/23558425/how-do-i-get-the-local-ip-address-in-go
+func GetLocalIP() string {
+    addrs, err := net.InterfaceAddrs()
+    if err != nil {
+        return ""
+    }
+    for _, address := range addrs {
+        // check the address type and if it is not a loopback the display it
+        if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+            if ipnet.IP.To4() != nil {
+                return ipnet.IP.String()
+            }
+        }
+    }
+    return ""
 }
